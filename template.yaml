@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  React + FastAPI + Bedrock Chat App
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 512
+    Runtime: python3.11
+    Architectures:
+      - x86_64
+
+Resources:
+  # DynamoDB Tables
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Tenants
+      AttributeDefinitions:
+        - AttributeName: TenantId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: TenantId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ChatHistory
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: ChatAppUserPool
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: ChatAppClient
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  # Lambda Authorizer
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/lambda_authorizer/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME_TENANTS: !Ref TenantsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantsTable
+
+  # API Gateway
+  ChatApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'*'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+          TenantAuthorizer:
+            FunctionPayloadType: REQUEST
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            Identity:
+              Headers:
+                - X-Tenant-Id
+                - X-Api-Key
+              ReauthorizeEvery: 0
+
+  # Backend Function
+  BackendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: app.main.handler
+      Environment:
+        Variables:
+          TABLE_NAME_TENANTS: !Ref TenantsTable
+          TABLE_NAME_CHAT_HISTORY: !Ref ChatHistoryTable
+          REGION_NAME: !Ref "AWS::Region"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChatHistoryTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
+      Events:
+        ApiChat:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatApi
+            Path: /api/chat
+            Method: post
+            Auth:
+              Authorizer: CognitoAuthorizer
+        TenantChat:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatApi
+            Path: /tenant/chat
+            Method: post
+            Auth:
+              Authorizer: TenantAuthorizer
+        Root:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatApi
+            Path: /
+            Method: get
+            Auth:
+              Authorizer: NONE
+        Docs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatApi
+            Path: /docs
+            Method: get
+            Auth:
+              Authorizer: NONE
+        OpenAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatApi
+            Path: /openapi.json
+            Method: get
+            Auth:
+              Authorizer: NONE
+
+Outputs:
+  ChatApiUrl:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub "https://${ChatApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref UserPoolClient
